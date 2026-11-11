@@ -62,7 +62,7 @@ const RUN_SPEED_MAX_RAW: f32 = OUTPUT_LIMIT_RAW;
 
 /// Recentring limits used by `Prepare`.
 const PREPARE_MAX_RPM: f32 = 80.0;
-const PREPARE_MAX_RAW: f32 = 6_000.0;
+const PREPARE_MAX_RAW: f32 = 12_000.0;
 /// Both axes must stay inside these error and speed limits for `PREPARE_SETTLE_TICKS`.
 const PREPARE_ANGLE_TOL_RAD: f32 = 0.10;
 const PREPARE_RPM_TOL: f32 = 25.0;
