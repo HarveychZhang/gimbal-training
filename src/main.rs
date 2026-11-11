@@ -36,12 +36,12 @@ const PITCH_FEEDBACK_ID: u16 = FEEDBACK_ID_BASE + (PITCH_MOTOR_ID as u16 - 1);
 /// Bench voltage limit in protocol counts; the protocol range is +/-25000.
 /// First bench run: 2000. Raise in steps (4000, 6000) once direction and stopping
 /// are confirmed; never exceed the protocol range.
-const OUTPUT_LIMIT_RAW: f32 = 2_000.0;
+const OUTPUT_LIMIT_RAW: f32 = 12_000.0;
 
 /// Single-turn reading of the reference pose, in counts (0..8191), measured on the bench.
 /// The joint angle is `direction * (raw * 2*PI / 8192 - zero)`, wrapped to +/-PI.
-const YAW_ZERO_OFFSET_COUNTS: f32 = 0.0;
-const PITCH_ZERO_OFFSET_COUNTS: f32 = 0.0;
+const YAW_ZERO_OFFSET_COUNTS: f32 = 3399.0;
+const PITCH_ZERO_OFFSET_COUNTS: f32 = 4145.0;
 /// +1 when a positive motor angle moves the joint in its positive direction.
 const YAW_DIRECTION: f32 = 1.0;
 const PITCH_DIRECTION: f32 = 1.0;
@@ -62,9 +62,9 @@ const RUN_SPEED_MAX_RAW: f32 = OUTPUT_LIMIT_RAW;
 
 /// Recentring limits used by `Prepare`.
 const PREPARE_MAX_RPM: f32 = 80.0;
-const PREPARE_MAX_RAW: f32 = 3_000.0;
+const PREPARE_MAX_RAW: f32 = 6_000.0;
 /// Both axes must stay inside these error and speed limits for `PREPARE_SETTLE_TICKS`.
-const PREPARE_ANGLE_TOL_RAD: f32 = 0.035;
+const PREPARE_ANGLE_TOL_RAD: f32 = 0.10;
 const PREPARE_RPM_TOL: f32 = 25.0;
 const PREPARE_SETTLE_TICKS: u16 = 200;
 const PREPARE_TIMEOUT_TICKS: u16 = 4_000;
@@ -85,9 +85,9 @@ const DT_S: f32 = 0.001;
 /// The demand threshold sits below `PREPARE_MAX_RPM`, so recentring can detect it too.
 const STALL_RPM_DEMAND: f32 = 50.0;
 const STALL_RAW_DEMAND: f32 = 1_500.0;
-const STALL_RPM_LIMIT: f32 = 25.0;
-const STALL_ANGLE_ERR_RAD: f32 = 0.05;
-const STALL_TICKS: u16 = 300;
+const STALL_RPM_LIMIT: f32 = 10.0;
+const STALL_ANGLE_ERR_RAD: f32 = 0.15;
+const STALL_TICKS: u16 = 1_000;
 
 /// Oscillation: the position error swings past +/-`OSC_AMP_RAD` and back, faster than
 /// `OSC_FREQ_HZ`, for `OSC_TICKS` in a row.
@@ -268,8 +268,6 @@ pub enum State {
 pub enum AxisId {
     Yaw,
     Pitch,
-    /// Used when a fault is not tied to one axis, such as a recentring timeout.
-    Both,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -278,8 +276,6 @@ pub enum FaultKind {
     Stall,
     /// Sustained oscillation above `OSC_FREQ_HZ`.
     Oscillation,
-    /// `Prepare` did not settle within `PREPARE_TIMEOUT_TICKS`.
-    PrepareTimeout,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -370,7 +366,10 @@ pub struct Control {
     pub armed: bool,
     /// Last fault, kept for display until a manual recovery.
     pub fault: Option<Fault>,
-    last_left_switch: u8,
+    /// Latched when the left switch reaches the down position in `Error`; the next up
+    /// position then recovers. The middle detent (a three-position switch) and a brief
+    /// invalid frame do not clear it.
+    recovery_armed: bool,
     prepare_ticks: u16,
     prepare_settle_ticks: u16,
     stall_ticks: [u16; 2],
@@ -389,7 +388,7 @@ impl Default for Control {
         // The small integral removes the droop that gravity and friction would otherwise
         // leave behind; set it to 0 when starting the position-loop tuning from scratch.
         yaw.position_pid = Pid {
-            kp: 150.0,
+            kp: 200.0,
             ki: 20.0,
             integral_limit: 60.0,
             maxout: RUN_POSITION_MAX_RPM,
@@ -397,7 +396,7 @@ impl Default for Control {
         };
         // Speed: rpm -> voltage counts; 80 counts per rpm, integral limited to 3000 counts.
         yaw.speed_pid = Pid {
-            kp: 80.0,
+            kp: 100.0,
             integral_limit: 3_000.0,
             maxout: OUTPUT_LIMIT_RAW,
             ..Pid::default()
@@ -407,14 +406,14 @@ impl Default for Control {
         pitch.motor.zero_offset_rad = PITCH_ZERO_OFFSET_COUNTS * (core::f32::consts::TAU / 8192.0);
         pitch.motor.direction = PITCH_DIRECTION;
         pitch.position_pid = Pid {
-            kp: 150.0,
-            ki: 20.0,
+            kp: 350.0,
+            ki: 80.0,
             integral_limit: 60.0,
             maxout: RUN_POSITION_MAX_RPM,
             ..Pid::default()
         };
         pitch.speed_pid = Pid {
-            kp: 80.0,
+            kp: 150.0,
             integral_limit: 3_000.0,
             maxout: OUTPUT_LIMIT_RAW,
             ..Pid::default()
@@ -430,7 +429,7 @@ impl Default for Control {
             pitch_feedback_age: u16::MAX,
             armed: false,
             fault: None,
-            last_left_switch: 3,
+            recovery_armed: false,
             prepare_ticks: 0,
             prepare_settle_ticks: 0,
             stall_ticks: [0; 2],
@@ -484,16 +483,16 @@ impl Control {
             if self.remote.is_some() {
                 self.remote_silent_ticks = 0;
                 if was_disconnected {
-                    // Do not let a switch that moved while the link was down count as a
-                    // gesture: the next enable or recovery needs a fresh edge.
-                    let (_, left) = self.remote_switch();
-                    self.last_left_switch = left;
+                    // A switch that moved while the link was down must not count as an
+                    // enable gesture; recovery needs a fresh down-then-up on the left
+                    // switch and is latched separately.
                     self.armed = false;
                 }
             }
         }
         if self.remote_silent_ticks >= REMOTE_SILENT_TICKS {
             self.remote = None;
+            self.recovery_armed = false;
         }
         if self.remote.is_none() {
             self.disable_all();
@@ -593,10 +592,21 @@ impl Control {
                             self.pitch.motor.angle_rad
                         );
                     } else if self.prepare_ticks >= PREPARE_TIMEOUT_TICKS {
-                        self.fail(Fault {
-                            axis: AxisId::Both,
-                            kind: FaultKind::PrepareTimeout,
-                        });
+                        // Recentring did not settle. Stop and return to Waiting instead of
+                        // latching Error: only stall and sustained oscillation are faults.
+                        let yaw_error =
+                            wrap_pi(self.yaw.target_angle_rad - self.yaw.motor.angle_rad);
+                        let pitch_error =
+                            wrap_pi(self.pitch.target_angle_rad - self.pitch.motor.angle_rad);
+                        rtt_target::rprintln!(
+                            "Prepare timeout: yaw_err={:.3} pitch_err={:.3} yaw_rpm={:.1} pitch_rpm={:.1} settle={} back to Waiting",
+                            yaw_error,
+                            pitch_error,
+                            self.yaw.motor.speed_rpm,
+                            self.pitch.motor.speed_rpm,
+                            self.prepare_settle_ticks
+                        );
+                        self.stop_to_waiting(false);
                     } else {
                         self.check_faults();
                     }
@@ -615,18 +625,19 @@ impl Control {
             }
             State::Error => {
                 // Manual recovery: right switch holds the middle position while the left
-                // switch goes down and then up. A held switch never recovers by itself.
-                if self.feedback_fresh()
-                    && right_switch == 3
-                    && self.last_left_switch == 2
-                    && left_switch == 1
-                {
-                    self.recover();
+                // switch goes down and then up. The down position is latched because a
+                // three-position switch always passes through the middle detent on its way
+                // up, and one invalid frame must not cancel the gesture.
+                if self.feedback_fresh() {
+                    match (right_switch, left_switch) {
+                        (3, 2) => self.recovery_armed = true,
+                        (3, 1) if self.recovery_armed => self.recover(),
+                        (_, 1) => self.recovery_armed = false,
+                        _ => {}
+                    }
                 }
             }
         }
-
-        self.last_left_switch = left_switch;
     }
 
     /// Set targets for the current state, run each axis's PIDs and write the voltage commands.
@@ -692,6 +703,7 @@ impl Control {
         self.pitch.speed_pid.maxout = PREPARE_MAX_RAW;
         self.armed = false;
         self.fault = None;
+        self.recovery_armed = false;
         self.stall_ticks = [0; 2];
         self.osc[0].reset();
         self.osc[1].reset();
@@ -711,6 +723,7 @@ impl Control {
         self.prepare_settle_ticks = 0;
         self.armed = keep_armed;
         self.fault = None;
+        self.recovery_armed = false;
     }
 
     /// True when both axes are close to the reference pose and nearly still.
@@ -791,6 +804,7 @@ impl Control {
         self.disable_all();
         self.fault = Some(fault);
         self.armed = false;
+        self.recovery_armed = false;
         self.prepare_ticks = 0;
         self.prepare_settle_ticks = 0;
         rtt_target::rprintln!(
@@ -806,6 +820,7 @@ impl Control {
     /// history and the detection counters, and resume remote debugging without recentring.
     fn recover(&mut self) {
         self.state = State::Running;
+        self.recovery_armed = false;
         self.yaw.target_angle_rad = self.yaw.motor.angle_rad;
         self.pitch.target_angle_rad = self.pitch.motor.angle_rad;
         self.yaw.target_rpm = 0.0;
@@ -883,9 +898,17 @@ async fn control_task(mut can: Can1, mut watchdog: dm_mc02::Watchdog) {
         log_ticks += 1;
         if log_ticks >= 200 {
             log_ticks = 0;
+            let (right_switch, left_switch) = control.remote_switch();
             rtt_target::rprintln!(
-                "state={:?} yaw a={:.3} t={:.3} rpm={:.1} trpm={:.1} out={:.0} | pitch a={:.3} t={:.3} rpm={:.1} trpm={:.1} out={:.0}",
+                "state={:?} link={} r={} l={} txf={} cerr={} pt={} ps={} yaw a={:.3} t={:.3} rpm={:.1} trpm={:.1} out={:.0} | pitch a={:.3} t={:.3} rpm={:.1} trpm={:.1} out={:.0}",
                 control.state,
+                control.remote.is_some(),
+                right_switch,
+                left_switch,
+                TX_FAILED.load(Ordering::Relaxed),
+                dm_mc02::CAN_ERRORS.load(Ordering::Relaxed),
+                control.prepare_ticks,
+                control.prepare_settle_ticks,
                 control.yaw.motor.angle_rad,
                 control.yaw.target_angle_rad,
                 control.yaw.motor.speed_rpm,
